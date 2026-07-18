@@ -12,7 +12,7 @@ import re
 import shlex
 from PIL import ImageFont
 
-OUT_W, OUT_H = 1080, 1920
+OUT_W, OUT_H = 720, 1280
 FONT_PATH = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 OUTPUT_FPS = 30
 
@@ -25,18 +25,18 @@ COLOR_WHITE = "white"
 OUTLINE_WIDTH = 0
 OUTLINE_COLOR = "black"
 
-TITLE_FONT_SIZE = 80
-TITLE_LINE1_Y = 140
-TITLE_LINE_GAP = 110
-TITLE_WORD_GAP = 22
+TITLE_FONT_SIZE = 53
+TITLE_LINE1_Y = 93
+TITLE_LINE_GAP = 73
+TITLE_WORD_GAP = 15
 
-LIST_FONT_SIZE = 58
-LIST_LEFT_MARGIN = 80
-LIST_RIGHT_MARGIN = 30
-LIST_START_Y = 680
-LIST_ROW_SPACING = 140
-LIST_NUMBER_CAPTION_GAP = 14
-LIST_MIN_CAPTION_FONT_SIZE = 30
+LIST_FONT_SIZE = 39
+LIST_LEFT_MARGIN = 53
+LIST_RIGHT_MARGIN = 20
+LIST_START_Y = 453
+LIST_ROW_SPACING = 93
+LIST_NUMBER_CAPTION_GAP = 9
+LIST_MIN_CAPTION_FONT_SIZE = 20
 
 
 class PipelineError(Exception):
@@ -136,7 +136,7 @@ def trim_and_normalize_clip(src, out_path, trim_seconds):
     cmd = (
         f"ffmpeg -y -i {shlex.quote(src)} {trim_flag} "
         f'-vf "{vf}" -r {OUTPUT_FPS} '
-        f"-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "
+        f"-c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p -threads 1 "
         f"-c:a aac -b:a 128k -ar 44100 "
         f"{shlex.quote(out_path)}"
     )
@@ -263,7 +263,7 @@ def build_ranking_video(clips, title_text, output_path, tmp_dir):
     cmd = (
         f"ffmpeg -y -i {shlex.quote(base_path)} "
         f'-vf "{vf}" '
-        f"-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "
+        f"-c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p -threads 1 "
         f"-c:a copy "
         f"{shlex.quote(output_path)}"
     )
