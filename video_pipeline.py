@@ -1,9 +1,10 @@
 """
 video_pipeline.py
 
-Parameterized version of the ranking-video builder, refactored so any
-number of clips / any title / any captions can be processed programmatically
-(used by the FastAPI backend in main.py).
+Parameterized version of the ranking-video builder. Style options (title
+colors, list text color, border, font) are passed in per-request via a
+`style` dict instead of being hardcoded, so the frontend can expose them
+as user-choosable controls.
 """
 
 import subprocess
@@ -13,17 +14,19 @@ import shlex
 from PIL import ImageFont
 
 OUT_W, OUT_H = 720, 1280
-FONT_PATH = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 OUTPUT_FPS = 30
 
-COLOR_BLUE = "#29ABE2"
-COLOR_GOLD = "#FFC107"
-COLOR_GREEN = "#33CC33"
-COLOR_ORANGE = "#FF7A00"
-COLOR_WHITE = "white"
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+FONT_CHOICES = {
+    "liberation": os.path.join(FONTS_DIR, "LiberationSans-Bold.ttf"),
+    "anton": os.path.join(FONTS_DIR, "Anton-Regular.ttf"),
+    "bebas": os.path.join(FONTS_DIR, "BebasNeue-Regular.ttf"),
+}
+DEFAULT_FONT_KEY = "liberation"
 
-OUTLINE_WIDTH = 0
-OUTLINE_COLOR = "black"
+COLOR_GOLD = "#FFC107"
+COLOR_WHITE = "white"
+COLOR_ORANGE = "#FF7A00"
 
 TITLE_FONT_SIZE = 53
 TITLE_LINE1_Y = 93
@@ -37,6 +40,18 @@ LIST_START_Y = 453
 LIST_ROW_SPACING = 93
 LIST_NUMBER_CAPTION_GAP = 9
 LIST_MIN_CAPTION_FONT_SIZE = 20
+
+# Sensible defaults for any style field not supplied by the caller.
+DEFAULT_STYLE = {
+    "font": DEFAULT_FONT_KEY,
+    "title_accent_color": "#29ABE2",   # first word of each title line
+    "title_secondary_color": COLOR_GOLD,  # rest of each title line
+    "list_color_mode": "auto",         # "auto" (cycling gold/white/orange) or "custom"
+    "list_custom_color": COLOR_WHITE,  # used when list_color_mode == "custom"
+    "border_enabled": False,
+    "border_width": 6,
+    "border_color": "black",
+}
 
 
 class PipelineError(Exception):
@@ -77,8 +92,17 @@ def escape_text(text):
     )
 
 
-def text_width(text, font_size):
-    font = ImageFont.truetype(FONT_PATH, font_size)
+def resolve_style(style):
+    """Merge caller-supplied style dict over the defaults, and validate the font key."""
+    merged = {**DEFAULT_STYLE, **(style or {})}
+    if merged["font"] not in FONT_CHOICES:
+        merged["font"] = DEFAULT_FONT_KEY
+    merged["font_path"] = FONT_CHOICES[merged["font"]]
+    return merged
+
+
+def text_width(text, font_size, font_path):
+    font = ImageFont.truetype(font_path, font_size)
     return font.getlength(text)
 
 
@@ -98,30 +122,27 @@ def wrap_two_lines(text):
     return " ".join(words[:mid]), " ".join(words[mid:])
 
 
-def auto_title_lines(title_text):
+def auto_title_lines(title_text, accent_color, secondary_color):
     """
-    Turn an arbitrary title string into a 2-line, 2-color-per-line structure:
-    line 1 -> (first word: blue, rest: gold)
-    line 2 -> (first word: green, rest: white)
-    This generalizes the "accent word + neutral rest" look used across
-    the reference designs, for any topic/title.
+    line 1 -> (first word: accent, rest: secondary)
+    line 2 -> (first word: accent, rest: secondary)
     """
     line1, line2 = wrap_two_lines(strip_emoji(title_text))
     lines = []
-
-    for line, colors in ((line1, (COLOR_BLUE, COLOR_GOLD)), (line2, (COLOR_GREEN, COLOR_WHITE))):
+    for line in (line1, line2):
         if not line:
             continue
         words = line.split()
         if len(words) == 1:
-            lines.append([(words[0], colors[0])])
+            lines.append([(words[0], accent_color)])
         else:
-            lines.append([(words[0], colors[0]), (" ".join(words[1:]), colors[1])])
+            lines.append([(words[0], accent_color), (" ".join(words[1:]), secondary_color)])
     return lines
 
 
-def auto_rank_colors(num_ranks):
-    """rank 1 (best) is always gold; the rest alternate white/orange."""
+def auto_rank_colors(num_ranks, mode, custom_color):
+    if mode == "custom":
+        return {rank: custom_color for rank in range(1, num_ranks + 1)}
     colors = {1: COLOR_GOLD}
     cycle = [COLOR_WHITE, COLOR_ORANGE]
     for i, rank in enumerate(range(2, num_ranks + 1)):
@@ -130,7 +151,6 @@ def auto_rank_colors(num_ranks):
 
 
 def trim_and_normalize_clip(src, out_path, trim_seconds):
-    """Trim to trim_seconds (if given) and normalize to the output canvas + fps in one pass."""
     vf = f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,crop={OUT_W}:{OUT_H}"
     trim_flag = f"-t {trim_seconds}" if trim_seconds else ""
     cmd = (
@@ -155,12 +175,18 @@ def concat_clips(clip_paths, output_path, tmp_dir):
     run(cmd)
 
 
-def build_title_filters(title_text):
-    title_lines = auto_title_lines(title_text)
+def build_title_filters(title_text, style):
+    font_path = style["font_path"]
+    border_w = style["border_width"] if style["border_enabled"] else 0
+    border_color = style["border_color"]
+
+    title_lines = auto_title_lines(
+        title_text, style["title_accent_color"], style["title_secondary_color"]
+    )
     filters = []
     for line_idx, line_words in enumerate(title_lines):
         y = TITLE_LINE1_Y + line_idx * TITLE_LINE_GAP
-        widths = [text_width(w, TITLE_FONT_SIZE) for w, _ in line_words]
+        widths = [text_width(w, TITLE_FONT_SIZE, font_path) for w, _ in line_words]
         total_width = sum(widths) + TITLE_WORD_GAP * (len(line_words) - 1)
         start_x = (OUT_W - total_width) / 2
 
@@ -168,32 +194,32 @@ def build_title_filters(title_text):
         for (word, color), w in zip(line_words, widths):
             esc = escape_text(word)
             filters.append(
-                f"drawtext=fontfile={FONT_PATH}:text='{esc}':"
+                f"drawtext=fontfile={font_path}:text='{esc}':"
                 f"fontsize={TITLE_FONT_SIZE}:fontcolor={color}:"
-                f"borderw={OUTLINE_WIDTH}:bordercolor={OUTLINE_COLOR}:"
+                f"borderw={border_w}:bordercolor={border_color}:"
                 f"x={x:.1f}:y={y}"
             )
             x += w + TITLE_WORD_GAP
     return filters
 
 
-def fit_caption_font_size(caption_text, available_width):
+def fit_caption_font_size(caption_text, available_width, font_path):
     size = LIST_FONT_SIZE
     while size > LIST_MIN_CAPTION_FONT_SIZE:
-        if text_width(caption_text, size) <= available_width:
+        if text_width(caption_text, size, font_path) <= available_width:
             break
         size -= 4
     return size
 
 
-def build_list_filters(clips):
-    """
-    clips: list of dicts in PLAY ORDER (worst to best), each with:
-        {"path": normalized_clip_path, "rank": int, "caption": str}
-    """
+def build_list_filters(clips, style):
+    font_path = style["font_path"]
+    border_w = style["border_width"] if style["border_enabled"] else 0
+    border_color = style["border_color"]
+
     filters = []
     num_ranks = len(clips)
-    rank_colors = auto_rank_colors(num_ranks)
+    rank_colors = auto_rank_colors(num_ranks, style["list_color_mode"], style["list_custom_color"])
 
     cursor = 0.0
     start_times = {}
@@ -209,26 +235,26 @@ def build_list_filters(clips):
         number_text = escape_text(f"{rank}.")
 
         filters.append(
-            f"drawtext=fontfile={FONT_PATH}:text='{number_text}':"
+            f"drawtext=fontfile={font_path}:text='{number_text}':"
             f"fontsize={LIST_FONT_SIZE}:fontcolor={color}:"
-            f"borderw={OUTLINE_WIDTH}:bordercolor={OUTLINE_COLOR}:"
+            f"borderw={border_w}:bordercolor={border_color}:"
             f"x={LIST_LEFT_MARGIN}:y={row_y}"
         )
 
         if rank in caption_by_rank:
-            number_w = text_width(f"{rank}.", LIST_FONT_SIZE)
+            number_w = text_width(f"{rank}.", LIST_FONT_SIZE, font_path)
             caption_x = LIST_LEFT_MARGIN + number_w + LIST_NUMBER_CAPTION_GAP
             caption_raw = strip_emoji(caption_by_rank[rank])
             available_width = OUT_W - LIST_RIGHT_MARGIN - caption_x
-            caption_font_size = fit_caption_font_size(caption_raw, available_width)
+            caption_font_size = fit_caption_font_size(caption_raw, available_width, font_path)
             caption_esc = escape_text(caption_raw)
             start_t = start_times[rank]
             caption_y = row_y + (LIST_FONT_SIZE - caption_font_size) / 2
 
             filters.append(
-                f"drawtext=fontfile={FONT_PATH}:text='{caption_esc}':"
+                f"drawtext=fontfile={font_path}:text='{caption_esc}':"
                 f"fontsize={caption_font_size}:fontcolor={color}:"
-                f"borderw={OUTLINE_WIDTH}:bordercolor={OUTLINE_COLOR}:"
+                f"borderw={border_w}:bordercolor={border_color}:"
                 f"x={caption_x:.1f}:y={caption_y:.1f}:"
                 f"enable='gte(t,{start_t:.3f})'"
             )
@@ -236,16 +262,14 @@ def build_list_filters(clips):
     return filters
 
 
-def build_ranking_video(clips, title_text, output_path, tmp_dir):
+def build_ranking_video(clips, title_text, output_path, tmp_dir, style=None):
     """
-    Main entry point.
-
     clips: list of dicts in PLAY ORDER (worst to best), each with:
         {"path": <source file path>, "rank": int, "caption": str, "trim_seconds": float|None}
     title_text: e.g. "Top 5 Various Ankle Breaks"
-    output_path: where to write the final mp4
-    tmp_dir: scratch directory for intermediate files (caller creates/cleans it up)
+    style: optional dict overriding any of DEFAULT_STYLE's keys
     """
+    resolved_style = resolve_style(style)
     os.makedirs(tmp_dir, exist_ok=True)
 
     normalized = []
@@ -257,7 +281,7 @@ def build_ranking_video(clips, title_text, output_path, tmp_dir):
     base_path = os.path.join(tmp_dir, "base_concat.mp4")
     concat_clips([c["path"] for c in normalized], base_path, tmp_dir)
 
-    filters = build_title_filters(title_text) + build_list_filters(normalized)
+    filters = build_title_filters(title_text, resolved_style) + build_list_filters(normalized, resolved_style)
     vf = ",".join(filters)
 
     cmd = (
