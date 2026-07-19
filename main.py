@@ -24,6 +24,7 @@ import shutil
 import tempfile
 import uuid
 
+import stripe
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,8 +33,6 @@ import video_pipeline as vp
 
 app = FastAPI(title="Countdown Cuts API")
 
-# Allow the frontend (served from anywhere, e.g. a static host) to call this API.
-# Tighten allow_origins to your real frontend domain before going to production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,7 +40,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_CLIPS = 15
+# ----------------------------------------------------------------------
+# Pricing tiers. "free" needs no payment. Paid tiers require a Stripe
+# Checkout session id (created via a Stripe Payment Link) whose payment
+# status we verify server-side before allowing the larger clip limit.
+# ----------------------------------------------------------------------
+TIERS = {
+    "free": {"max_clips": 3},
+    "full": {"max_clips": 10},
+    "premium": {"max_clips": 15},
+}
+
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")  # set this in Render's environment variables, never in code
+
+# In-memory set of Stripe session IDs already used to generate a video.
+# NOTE: this resets if the server restarts and won't work across multiple
+# server instances - fine for a single free-tier Render instance, but if
+# you scale to multiple instances you'd want a shared store (e.g. Redis)
+# instead.
+_used_sessions = set()
+
 MAX_FILE_SIZE_MB = 200
 
 
@@ -50,12 +68,57 @@ def health():
     return {"status": "ok"}
 
 
+def verify_paid_session(tier: str, session_id: str | None):
+    """Raise HTTPException if this tier requires payment and the session
+    isn't a valid, unused, paid Stripe Checkout session."""
+    if tier == "free":
+        return
+
+    if tier not in TIERS:
+        raise HTTPException(400, f"Unknown tier '{tier}'")
+
+    if not session_id:
+        raise HTTPException(402, f"The '{tier}' tier requires a completed payment (missing session_id)")
+
+    if session_id in _used_sessions:
+        raise HTTPException(402, "This payment has already been used for a previous video")
+
+    if not stripe.api_key:
+        raise HTTPException(500, "Server isn't configured with a Stripe secret key")
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        raise HTTPException(402, f"Couldn't verify payment session: {e}")
+
+    if session.payment_status != "paid":
+        raise HTTPException(402, "Payment for this session was not completed")
+
+    _used_sessions.add(session_id)
+
+
 @app.post("/api/process")
 async def process_video(
     title: str = Form(...),
     clips_json: str = Form(...),
+    tier: str = Form("free"),
+    session_id: str | None = Form(None),
+    font: str = Form("liberation"),
+    title_accent_color: str = Form("#29ABE2"),
+    title_secondary_color: str = Form("#FFC107"),
+    list_color_mode: str = Form("auto"),
+    list_custom_color: str = Form("white"),
+    border_enabled: bool = Form(False),
+    border_width: int = Form(6),
+    border_color: str = Form("black"),
+    special_requests: str = Form(""),
     files: list[UploadFile] = File(...),
 ):
+    if tier not in TIERS:
+        raise HTTPException(400, f"Unknown tier '{tier}'")
+
+    verify_paid_session(tier, session_id)
+
     try:
         clip_meta = json.loads(clips_json)
     except json.JSONDecodeError:
@@ -70,12 +133,37 @@ async def process_video(
             f"Mismatch: {len(clip_meta)} clip entries but {len(files)} files uploaded",
         )
 
-    if len(clip_meta) > MAX_CLIPS:
-        raise HTTPException(400, f"Too many clips (max {MAX_CLIPS})")
+    max_clips = TIERS[tier]["max_clips"]
+    if len(clip_meta) > max_clips:
+        raise HTTPException(
+            400,
+            f"The '{tier}' tier allows up to {max_clips} clips (you sent {len(clip_meta)}). Upgrade for more.",
+        )
 
     for item in clip_meta:
         if "rank" not in item or "caption" not in item:
             raise HTTPException(400, "Each clip entry needs 'rank' and 'caption'")
+
+    if font not in vp.FONT_CHOICES:
+        raise HTTPException(400, f"Unknown font '{font}'. Choices: {list(vp.FONT_CHOICES)}")
+
+    style = {
+        "font": font,
+        "title_accent_color": title_accent_color,
+        "title_secondary_color": title_secondary_color,
+        "list_color_mode": list_color_mode,
+        "list_custom_color": list_custom_color,
+        "border_enabled": border_enabled,
+        "border_width": border_width,
+        "border_color": border_color,
+    }
+
+    # special_requests isn't used by the automated pipeline (there's no human
+    # to read it) - it's accepted so the frontend can collect it, e.g. for
+    # your own records or to extend later (custom fonts, manual touch-ups, etc).
+    # Logged here so you can see it in Render's logs if you want to review requests.
+    if special_requests.strip():
+        print(f"[special_requests] tier={tier} title={title!r}: {special_requests!r}")
 
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(tempfile.gettempdir(), "countdown_cuts", job_id)
@@ -112,7 +200,7 @@ async def process_video(
         clips.sort(key=lambda c: -c["rank"])  # highest rank number (worst) plays first
 
         output_path = os.path.join(job_dir, "final_ranked_video.mp4")
-        vp.build_ranking_video(clips, title, output_path, tmp_dir)
+        vp.build_ranking_video(clips, title, output_path, tmp_dir, style=style)
 
         if not os.path.isfile(output_path):
             raise HTTPException(500, "Processing finished but no output file was produced")
